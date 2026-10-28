@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f1115">
+<title>Ring Dashboard</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #16181d; --muted: #6b7280;
+    --accent: #e0245e; --accent2: #2f7de1; --line: #e3e5ea; --ok: #1a9f5b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --card: #181b21; --text: #eceef2; --muted: #98a0ad;
+      --accent: #ff4d82; --accent2: #5aa0ff; --line: #2a2e37; --ok: #3ddc8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; display: grid; gap: 12px; }
+  h1 { font-size: 20px; margin: 4px 0 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .label { color: var(--muted); font-size: 13px; }
+  .value { font-size: 36px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .value small { font-size: 15px; font-weight: 500; color: var(--muted); }
+  button, select {
+    font: inherit; padding: 10px 16px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  canvas { width: 100%; height: 180px; display: block; }
+  #status { color: var(--muted); font-size: 14px; }
+  #status.ok { color: var(--ok); }
+  #unsupported { display: none; color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ring Dashboard</h1>
+
+  <div class="card row">
+    <div>
+      <div id="status">Nicht verbunden</div>
+      <div id="unsupported">Dieser Browser unterstützt kein Web Bluetooth. Bitte Chrome oder Edge nutzen.</div>
+    </div>
+    <div class="row">
+      <button id="connect" class="primary">Verbinden</button>
+      <button id="disconnect" disabled>Trennen</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Puls live</div><div class="value"><span id="hr">–</span> <small>bpm</small></div></div>
+    <div class="card"><div class="label">Akku</div><div class="value"><span id="battery">–</span> <small>%</small></div></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <div class="label">Live-Puls</div>
+      <div class="row">
+        <button id="measure" disabled>Messung starten</button>
+        <button id="clear">Verlauf löschen</button>
+      </div>
+    </div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="card row">
+    <div class="label">Gespeicherte Ring-Daten</div>
+    <div class="row">
+      <select id="day" aria-label="Tag"></select>
+      <button id="fetch" disabled>Abrufen</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Schritte</div><div class="value"><span id="steps">–</span></div></div>
+    <div class="card"><div class="label">Strecke</div><div class="value"><span id="dist">–</span> <small>km</small></div></div>
+    <div class="card"><div class="label">Kalorien</div><div class="value"><span id="kcal">–</span> <small>kcal</small></div></div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:8px">Schritte pro Stunde</div>
+    <canvas id="stepsChart"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:8px">Puls über den Tag</div>
+    <canvas id="dayChart"></canvas>
+  </div>
+</main>
+
+<script>
+const UART_SERVICE = "6e40fff0-b5a3-f393-e0a9-e50e24dcca9e";
+const UART_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // Browser -> Ring
+const UART_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // Ring -> Browser
+const CMD_SET_TIME = 0x01, CMD_BATTERY = 0x03, CMD_HR_LOG = 0x15, CMD_STEPS = 0x43;
+const CMD_REALTIME_START = 0x69, CMD_REALTIME_STOP = 0x6a;
+const STORE_KEY = "ring-hr-history", MAX_POINTS = 5000;
+
+const $ = (id) => document.getElementById(id);
+let device = null, rx = null, measuring = false, pending = null;
+let history = load();
+let stepSlots = [], hrDay = [];
+
+function load() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch { return []; }
+}
+function save() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(history.slice(-MAX_POINTS))); } catch {}
+}
+
+// 16 Byte: Kommando + 14 Byte Daten + Summen-Prüfbyte
+function packet(cmd, data = []) {
+  const p = new Uint8Array(16);
+  p[0] = cmd;
+  data.forEach((b, i) => (p[1 + i] = b));
+  p[15] = p.slice(0, 15).reduce((a, b) => a + b, 0) & 0xff;
+  return p;
+}
+const bcd = (x) => (x >> 4) * 10 + (x & 15);
+const toBcd = (n) => ((Math.floor(n / 10) << 4) | n % 10);
+
+// Ringuhr auf lokale Zeit setzen (wie die QRing-App); letztes Byte: Sprache
+function setClock() {
+  const n = new Date();
+  const f = [n.getFullYear() % 100, n.getMonth() + 1, n.getDate(), n.getHours(), n.getMinutes(), n.getSeconds()];
+  return rx.writeValueWithoutResponse(packet(CMD_SET_TIME, [...f.map(toBcd), 1]));
+}
+
+function setStatus(text, ok = false) {
+  $("status").textContent = text;
+  $("status").className = ok ? "ok" : "";
+}
+
+function onData(event) {
+  const d = new Uint8Array(event.target.value.buffer);
+  if (pending && d[0] === pending.cmd) {
+    pending.packets.push(d);
+    pending.last = Date.now();
+  }
+  if (d[0] === CMD_BATTERY) {
+    $("battery").textContent = d[1];
+  } else if (d[0] === CMD_REALTIME_START && d[1] === 1 && d[3] > 0) {
+    $("hr").textContent = d[3];
+    history.push({ t: Date.now(), bpm: d[3] });
+    save();
+    drawLive();
+  }
+}
+
+// Kommando senden und Antwortpakete sammeln, bis eine Weile nichts mehr kommt.
+async function request(cmd, data, idleMs = 800, maxMs = 8000) {
+  pending = { cmd, packets: [], last: Date.now() };
+  const start = Date.now();
+  await rx.writeValueWithoutResponse(packet(cmd, data));
+  while (Date.now() - pending.last < idleMs && Date.now() - start < maxMs) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const packets = pending.packets;
+  pending = null;
+  return packets;
+}
+
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "R0" }, { namePrefix: "R1" }, { namePrefix: "COLMI" }],
+      optionalServices: [UART_SERVICE],
+    });
+    setStatus("Verbinde…");
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(UART_SERVICE);
+    rx = await service.getCharacteristic(UART_RX);
+    const tx = await service.getCharacteristic(UART_TX);
+    await tx.startNotifications();
+    tx.addEventListener("characteristicvaluechanged", onData);
+    await setClock();
+    await rx.writeValueWithoutResponse(packet(CMD_BATTERY));
+    setStatus("Verbunden mit " + device.name, true);
+    $("connect").disabled = true;
+    ["disconnect", "measure", "fetch"].forEach((id) => ($(id).disabled = false));
+  } catch (err) {
+    setStatus(err.name === "NotFoundError" ? "Kein Gerät gewählt" : "Fehler: " + err.message);
+  }
+}
+
+function onDisconnected() {
+  measuring = false;
+  rx = null;
+  setStatus("Verbindung getrennt");
+  $("connect").disabled = false;
+  ["disconnect", "measure", "fetch"].forEach((id) => ($(id).disabled = true));
+  $("measure").textContent = "Messung starten";
+}
+
+async function toggleMeasure() {
+  if (!rx) return;
+  measuring = !measuring;
+  await rx.writeValueWithoutResponse(
+    measuring ? packet(CMD_REALTIME_START, [1, 1]) : packet(CMD_REALTIME_STOP, [1, 0, 0])
+  );
+  $("measure").textContent = measuring ? "Messung stoppen" : "Messung starten";
+  setStatus(measuring ? "Messe… (Ring tragen, Hand ruhig halten)" : "Verbunden mit " + device.name, true);
+}
+
+// ---- Gespeicherte Daten vom Ring ----
+async function fetchDay() {
+  if (!rx) return;
+  const offset = Number($("day").value);
+  $("fetch").disabled = true;
+  setStatus("Rufe Tagesdaten ab…");
+  try {
+    // Schritte: 15-Minuten-Slots
+    const sp = await request(CMD_STEPS, [offset, 0x0f, 0x00, 0x5f, 0x01]);
+    stepSlots = sp
+      .filter((p) => p[1] !== 0xf0 && p[1] !== 0xff)
+      .map((p) => ({
+        slot: p[4],
+        kcal: (p[7] | (p[8] << 8)) / 100,
+        steps: p[9] | (p[10] << 8),
+        dist: p[11] | (p[12] << 8),
+      }));
+
+    // Pulsverlauf: Start = lokale Mitternacht des Tages, little-endian
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    midnight.setDate(midnight.getDate() - offset);
+    const ts = Math.floor(midnight.getTime() / 1000);
+    const hp = await request(CMD_HR_LOG, [ts & 255, (ts >> 8) & 255, (ts >> 16) & 255, (ts >>> 24) & 255]);
+    const interval = hp.find((p) => p[1] === 0)?.[3] || 5;
+    const values = [];
+    hp.filter((p) => p[1] !== 0)
+      .sort((a, b) => a[1] - b[1])
+      .forEach((p) => values.push(...(p[1] === 1 ? p.slice(6, 15) : p.slice(2, 15))));
+    hrDay = values.map((bpm, i) => ({ min: i * interval, bpm })).filter((v) => v.bpm > 0);
+    renderDay();
+    setStatus("Verbunden mit " + device.name, true);
+  } catch (err) {
+    setStatus("Fehler: " + err.message);
+  }
+  $("fetch").disabled = false;
+}
+
+function renderDay() {
+  const sum = (k) => stepSlots.reduce((a, s) => a + s[k], 0);
+  $("steps").textContent = stepSlots.length ? sum("steps") : "–";
+  $("dist").textContent = stepSlots.length ? (sum("dist") / 1000).toFixed(2) : "–";
+  $("kcal").textContent = stepSlots.length ? Math.round(sum("kcal")) : "–";
+  drawSteps();
+  drawDay();
+}
+
+// ---- Diagramme ----
+function prep(id) {
+  const canvas = $(id), dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.font = "12px system-ui";
+  const css = getComputedStyle(document.documentElement);
+  const c = (n) => css.getPropertyValue(n).trim();
+  return { ctx, w, h, muted: c("--muted"), line: c("--line"), accent: c("--accent"), accent2: c("--accent2") };
+}
+
+function gridLines(g, min, max, left) {
+  const { ctx, w, h } = g;
+  ctx.strokeStyle = g.line; ctx.fillStyle = g.muted; ctx.textAlign = "left";
+  const y = (v) => h - 18 - ((v - min) / (max - min)) * (h - 30);
+  [min, (min + max) / 2, max].forEach((v) => {
+    ctx.beginPath(); ctx.moveTo(left - 4, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
+    ctx.fillText(Math.round(v), 2, y(v) + 4);
+  });
+  return y;
+}
+
+function empty(g, text) {
+  g.ctx.fillStyle = g.muted; g.ctx.textAlign = "left";
+  g.ctx.fillText(text, 8, g.h / 2);
+}
+
+function drawLive() {
+  const g = prep("chart"), { ctx, w, h } = g;
+  const pts = history.slice(-200);
+  if (pts.length < 2) return empty(g, "Noch keine Daten – Messung starten");
+  const min = Math.min(...pts.map((p) => p.bpm)) - 5, max = Math.max(...pts.map((p) => p.bpm)) + 5;
+  const y = gridLines(g, min, max, 36);
+  const x = (i) => 36 + (i / (pts.length - 1)) * (w - 44);
+  ctx.beginPath();
+  pts.forEach((p, i) => (i ? ctx.lineTo(x(i), y(p.bpm)) : ctx.moveTo(x(i), y(p.bpm))));
+  ctx.strokeStyle = g.accent; ctx.lineWidth = 2; ctx.stroke();
+  const t = (ms) => new Date(ms).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+  ctx.fillStyle = g.muted; ctx.textAlign = "left"; ctx.fillText(t(pts[0].t), 36, h - 2);
+  ctx.textAlign = "right"; ctx.fillText(t(pts[pts.length - 1].t), w - 8, h - 2);
+}
+
+function drawSteps() {
+  const g = prep("stepsChart"), { ctx, w, h } = g;
+  if (!stepSlots.length) return empty(g, "Keine Schrittdaten für diesen Tag");
+  const perHour = Array(24).fill(0);
+  stepSlots.forEach((s) => (perHour[Math.min(23, Math.floor(s.slot / 4))] += s.steps));
+  const max = Math.max(...perHour, 10);
+  const y = gridLines(g, 0, max, 36);
+  const bw = (w - 44) / 24;
+  ctx.fillStyle = g.accent2;
+  perHour.forEach((v, i) => ctx.fillRect(40 + i * bw + 1, y(v), bw - 2, y(0) - y(v)));
+  ctx.fillStyle = g.muted; ctx.textAlign = "center";
+  [0, 6, 12, 18].forEach((hr) => ctx.fillText(hr + " Uhr", 40 + hr * bw + bw / 2, h - 2));
+}
+
+function drawDay() {
+  const g = prep("dayChart"), { ctx, w, h } = g;
+  if (!hrDay.length) return empty(g, "Keine Pulsdaten für diesen Tag");
+  const min = Math.min(...hrDay.map((p) => p.bpm)) - 5, max = Math.max(...hrDay.map((p) => p.bpm)) + 5;
+  const y = gridLines(g, min, max, 36);
+  const x = (m) => 40 + (m / 1440) * (w - 48);
+  ctx.beginPath();
+  hrDay.forEach((p, i) => (i ? ctx.lineTo(x(p.min), y(p.bpm)) : ctx.moveTo(x(p.min), y(p.bpm))));
+  ctx.strokeStyle = g.accent; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = g.accent;
+  hrDay.forEach((p) => { ctx.beginPath(); ctx.arc(x(p.min), y(p.bpm), 2.5, 0, 7); ctx.fill(); });
+  ctx.fillStyle = g.muted; ctx.textAlign = "center";
+  [0, 6, 12, 18].forEach((hr) => ctx.fillText(hr + " Uhr", x(hr * 60) + 10, h - 2));
+}
+
+function drawAll() { drawLive(); drawSteps(); drawDay(); }
+
+// Tagesauswahl: heute + 6 Tage zurück
+["Heute", "Gestern"].concat([2, 3, 4, 5, 6].map((n) => `Vor ${n} Tagen`)).forEach((label, i) => {
+  $("day").add(new Option(label, i));
+});
+
+$("connect").onclick = connect;
+$("disconnect").onclick = () => device && device.gatt.disconnect();
+$("measure").onclick = toggleMeasure;
+$("fetch").onclick = fetchDay;
+$("clear").onclick = () => { history = []; save(); drawLive(); };
+window.addEventListener("resize", drawAll);
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+
+if (!navigator.bluetooth) {
+  $("unsupported").style.display = "block";
+  $("status").style.display = "none";
+  $("connect").disabled = true;
+}
+if (history.length) $("hr").textContent = history[history.length - 1].bpm;
+drawAll();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
